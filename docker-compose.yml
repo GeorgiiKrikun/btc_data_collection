@@ -1,0 +1,15 @@
+services:
+  quant2:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-100}
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
