@@ -5,6 +5,7 @@ services:
       args:
         UID: ${UID:-1000}
         GID: ${GID:-100}
+    image: btc_data_collection:latest
     restart: unless-stopped
     volumes:
       - ./data:/app/data
@@ -13,3 +14,31 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  uploader:
+    image: btc_data_collection:latest
+    command: ["./target/release/uploader"]
+    depends_on:
+      - quant2
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      RUST_LOG: ${RUST_LOG:-uploader=info}
+      # AWS SDK reads the key/secret from this file (mounted via the secret below)
+      AWS_SHARED_CREDENTIALS_FILE: /run/secrets/s3_credentials
+    secrets:
+      - s3_credentials
+    volumes:
+      # read-write: the uploader also prunes old local files (RETENTION_DAYS)
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  s3_credentials:
+    file: ./secrets/s3_credentials

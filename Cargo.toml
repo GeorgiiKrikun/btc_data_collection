@@ -15,3 +15,13 @@ csv = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+
+[[bin]]
+name = "quant_2"
+path = "src/main.rs"
+
+[[bin]]
+name = "uploader"
+path = "src/bin/uploader.rs"

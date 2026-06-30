@@ -5,16 +5,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Build
+# Build (compiles both binaries: quant_2 collector + uploader)
 cargo build --release
 
-# Run locally (data written to ./data/)
-cargo run --release
+# Run the collector locally (data written to ./data/)
+cargo run --release --bin quant_2
+
+# Run the S3 uploader locally (reads config from env; see .env.example)
+S3_BUCKET=... S3_ENDPOINT_URL=... cargo run --release --bin uploader
 
 # Control log level (default: info)
-RUST_LOG=quant_2=debug cargo run --release
+RUST_LOG=quant_2=debug cargo run --release --bin quant_2
 
-# Run in Docker (production mode, auto-restarts)
+# Run in Docker (collector + uploader, production mode, auto-restarts)
+cp .env.example .env   # then fill in S3 creds/bucket
 UID=$(id -u) GID=$(id -g) docker compose up -d
 docker compose logs -f
 docker compose down
@@ -39,6 +43,12 @@ Binance WS  →  collector::run()  →  mpsc channels  →  writer::writer_task(
 - `writer.rs` — buffers ticks in memory and flushes to CSV either every 5 seconds or when the buffer reaches 500 records. CSV files are date-partitioned (`depth5_tick_YYYYMMDD.csv`, `trades_tick_YYYYMMDD.csv`) and appended to across process restarts; the CSV header is written only if the file doesn't yet exist.
 
 - `models.rs` — two layers of types: raw Binance wire format (`StreamEnvelope`, `DepthData`, `AggTradeData`) and the flattened CSV output types (`DepthTick`, `TradeTick`). `DepthTick` captures all 5 bid/ask price+quantity levels plus a microsecond receive timestamp.
+
+- `bin/uploader.rs` — a **separate binary** (own Docker container) that syncs `./data/*.csv` to an S3-compatible bucket (used with Hetzner Object Storage) and prunes old local copies. Every `UPLOAD_INTERVAL_SECS` (default 300) it scans the data dir and, for each file, parses the `YYYYMMDD` embedded in the name (`..._YYYYMMDD.csv`):
+  - **Upload (finalized only):** files whose date is before the current UTC day are uploaded once via `PutObject`. The current day's (or any future-dated) file is still being appended by the collector and is skipped. A `HeadObject` check means a file already present in the bucket with the same size is not re-uploaded (so restarts don't re-send). Confirmed-present paths are cached in an in-memory `HashSet` to skip the round-trip on later passes.
+  - **Retention (delete):** if `RETENTION_DAYS > 0`, finalized files older than that many days are deleted locally — but only after the upload/`HeadObject` step confirmed the object exists in the bucket, so unuploaded data is never destroyed.
+
+  Configured entirely via env vars (`S3_BUCKET` required; `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX`, `S3_FORCE_PATH_STYLE`, `DATA_DIR`, `UPLOAD_INTERVAL_SECS`, `RETENTION_DAYS`); credentials use the standard AWS chain. See `.env.example`. The uploader mounts `./data` read-write (it deletes) and is independent of the collector's lifecycle.
 
 ## Output schema
 
