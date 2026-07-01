@@ -39,6 +39,56 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  # --- Observability ---
+
+  # Web log viewer. Reads logs for every container on the host via the Docker
+  # socket (read-only), so quant2 + uploader show up automatically. It has NO
+  # published port: it is only reachable through the npm reverse proxy below.
+  dozzle:
+    image: amir20/dozzle:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+    networks:
+      - proxy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Reverse proxy: terminates TLS and enforces password protection (NPM
+  # "Access Lists"). Configure proxy hosts / certs / auth in the admin UI, then
+  # point a proxy host at `dozzle:8080`.
+  #
+  # The admin UI (port 81) is bound to 127.0.0.1 only, so it is NOT reachable
+  # from the internet. Reach it on demand via an SSH tunnel:
+  #     ssh -L 8181:localhost:81 <user>@<server>
+  # then browse http://localhost:8181 on your laptop. Only 80/443 are public.
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"              # HTTP (redirect to HTTPS)
+      - "443:443"            # HTTPS runtime — the only public entry point
+      - "127.0.0.1:81:81"    # admin UI, localhost-only (SSH-tunnel to reach)
+    volumes:
+      - ./npm/data:/data
+      - ./npm/letsencrypt:/etc/letsencrypt
+    networks:
+      - proxy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  proxy:
+    driver: bridge
+
 secrets:
   s3_credentials:
     file: ./secrets/s3_credentials
