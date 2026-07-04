@@ -56,7 +56,9 @@ services:
     env_file:
       - .env
     environment:
-      RUST_LOG: ${RUST_LOG:-logwatch=info}
+      # Diagnostics: set LOGWATCH_LOG=logwatch=debug (or =trace to see every raw
+      # log line logwatch ingests) in .env, then `docker compose up -d logwatch`.
+      RUST_LOG: ${LOGWATCH_LOG:-logwatch=info}
       COLLECTOR_SERVICE: quant2
       UPLOADER_SERVICE: uploader
       # keep in sync with the uploader's UPLOAD_INTERVAL_SECS (alert at ~3x)

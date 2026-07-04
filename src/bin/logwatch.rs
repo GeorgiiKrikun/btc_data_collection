@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -137,7 +137,10 @@ impl Alerter {
         if due {
             i.last_sent.insert(key.to_string(), now);
             drop(i);
+            debug!("alert fire (transient) key='{key}'");
             self.send(msg);
+        } else {
+            debug!("alert suppressed (cooldown) key='{key}'");
         }
     }
 
@@ -156,17 +159,15 @@ impl Alerter {
                 i.active.insert(key.to_string());
                 i.last_sent.insert(key.to_string(), now);
                 drop(i);
+                debug!("alert fire (sticky, {}) key='{key}'", if is_active { "reminder" } else { "rising edge" });
                 self.send(msg);
             }
         } else if i.active.remove(key) {
             i.last_sent.remove(key);
             drop(i);
+            debug!("alert clear (sticky, falling edge) key='{key}'");
             self.send(recovery);
         }
-    }
-
-    fn has_active(&self) -> bool {
-        !self.inner.lock().unwrap().active.is_empty()
     }
 }
 
@@ -226,12 +227,16 @@ fn handle_line(line: &str, kind: Kind, service: &str, state: &Mutex<State>, aler
                         st.last_depth = Some(d);
                         st.last_depth_change = Some(now);
                     }
+                    debug!("collector heartbeat: total_depth={d} advanced={advanced}");
+                } else {
+                    debug!("collector 'Flush tick' seen but 'total depth=' did not parse");
                 }
             }
         }
         Kind::Uploader => {
             if line.contains("sync pass complete") {
                 st.last_sync_pass = Some(now);
+                debug!("uploader heartbeat: 'sync pass complete' seen");
             }
         }
     }
@@ -241,19 +246,45 @@ fn handle_line(line: &str, kind: Kind, service: &str, state: &Mutex<State>, aler
 // Docker log streaming
 // ---------------------------------------------------------------------------
 
-async fn list_ids(docker: &Docker, service: &str) -> Result<Vec<String>> {
-    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec![format!("com.docker.compose.service={service}")],
-    );
+/// Lists running containers and matches them to a compose service *client-side*
+/// (by the `com.docker.compose.service` label, falling back to container name).
+/// We deliberately do NOT use the Docker API's server-side `filters` param: if
+/// it matches nothing it returns an empty list with no error, which is silent
+/// and hard to debug. Filtering here means we can log exactly what we matched.
+async fn list_ids(docker: &Docker, service: &str) -> Result<Vec<(String, String)>> {
     let opts = ListContainersOptions::<String> {
         all: false,
-        filters,
         ..Default::default()
     };
     let containers = docker.list_containers(Some(opts)).await?;
-    Ok(containers.into_iter().filter_map(|c| c.id).collect())
+    debug!(
+        "service='{service}': {} running container(s) to consider",
+        containers.len()
+    );
+    let mut matched = Vec::new();
+    for c in containers {
+        let Some(id) = c.id else { continue };
+        let name = c
+            .names
+            .unwrap_or_default()
+            .join(",")
+            .trim_start_matches('/')
+            .to_string();
+        let svc = c
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("com.docker.compose.service"))
+            .map(String::as_str);
+        let is_match = svc == Some(service) || name.contains(service);
+        debug!(
+            "  candidate name='{name}' compose-service={svc:?} => {}",
+            if is_match { "MATCH" } else { "skip" }
+        );
+        if is_match {
+            matched.push((id, name));
+        }
+    }
+    Ok(matched)
 }
 
 async fn stream_logs(
@@ -276,6 +307,7 @@ async fn stream_logs(
 
     let mut stream = docker.logs(&id, Some(opts));
     let mut buf = String::new();
+    let mut first = true;
     while let Some(item) = stream.next().await {
         match item {
             Ok(output) => {
@@ -284,6 +316,11 @@ async fn stream_logs(
                     let line: String = buf.drain(..=pos).collect();
                     let line = line.trim_end();
                     if !line.is_empty() {
+                        if first {
+                            debug!("first log line received from service='{service}': {line}");
+                            first = false;
+                        }
+                        trace!("[{service}] {line}");
                         handle_line(line, kind, &service, &state, &alerter);
                     }
                 }
@@ -307,19 +344,31 @@ async fn watch_service(
     alerter: Arc<Alerter>,
 ) {
     let mut tracked: HashSet<String> = HashSet::new();
+    let mut warned_empty = false;
     loop {
         match list_ids(&docker, &service).await {
-            Ok(ids) => {
-                for id in ids {
-                    if tracked.insert(id.clone()) {
-                        tokio::spawn(stream_logs(
-                            docker.clone(),
-                            id,
-                            kind,
-                            service.clone(),
-                            state.clone(),
-                            alerter.clone(),
-                        ));
+            Ok(found) => {
+                if found.is_empty() {
+                    if !warned_empty {
+                        warn!(
+                            "no running container matched service='{service}' — check COLLECTOR_SERVICE/UPLOADER_SERVICE against the container name/label"
+                        );
+                        warned_empty = true;
+                    }
+                } else {
+                    warned_empty = false;
+                    for (id, name) in found {
+                        if tracked.insert(id.clone()) {
+                            info!("watching container '{name}' for service='{service}'");
+                            tokio::spawn(stream_logs(
+                                docker.clone(),
+                                id,
+                                kind,
+                                service.clone(),
+                                state.clone(),
+                                alerter.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -355,6 +404,12 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
         // Collector alive? (the every-5s Flush tick is the heartbeat)
         let tick_age = now.duration_since(last_tick);
         let collector_alive = tick_age <= cfg.flush_max_silence;
+        debug!(
+            "staleness check: flush_tick_age={}s (alive={collector_alive}), depth_change_age={}s, sync_pass_age={}s",
+            tick_age.as_secs(),
+            now.duration_since(last_change).as_secs(),
+            now.duration_since(last_pass).as_secs(),
+        );
         alerter.sticky(
             "collector:heartbeat",
             !collector_alive,
@@ -422,18 +477,18 @@ async fn telegram_task(
     }
 }
 
-async fn heartbeat_task(agent: ureq::Agent, url: String, alerter: Arc<Alerter>) {
+/// Dead-man's switch: while logwatch is alive it pings the URL every 60s. It
+/// intentionally does NOT report health here — content problems go to Telegram.
+/// The healthcheck therefore turns red only when logwatch stops pinging, i.e.
+/// the sidecar crashed, the host died, or the network dropped — the one gap
+/// Telegram can't cover.
+async fn heartbeat_task(agent: ureq::Agent, url: String) {
     let mut ticker = interval(Duration::from_secs(60));
-    let base = url.trim_end_matches('/').to_string();
     loop {
         ticker.tick().await;
-        let target = if alerter.has_active() {
-            format!("{base}/fail")
-        } else {
-            base.clone()
-        };
         let agent = agent.clone();
-        let _ = tokio::task::spawn_blocking(move || agent.get(&target).call()).await;
+        let url = url.clone();
+        let _ = tokio::task::spawn_blocking(move || agent.get(&url).call()).await;
     }
 }
 
@@ -449,6 +504,19 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Arc::new(Config::from_env()?);
+    debug!(
+        "config: collector='{}' uploader='{}' flush_max={}s counter_max={}s uploader_max={}s cooldown={}s grace={}s check_every={}s healthcheck={} chat_id={}",
+        cfg.collector_service,
+        cfg.uploader_service,
+        cfg.flush_max_silence.as_secs(),
+        cfg.counter_max_stale.as_secs(),
+        cfg.uploader_max_silence.as_secs(),
+        cfg.cooldown.as_secs(),
+        cfg.startup_grace.as_secs(),
+        cfg.check_interval.as_secs(),
+        cfg.healthcheck_url.is_some(),
+        cfg.chat_id,
+    );
     let docker = Docker::connect_with_unix_defaults()
         .context("connect to /var/run/docker.sock")?;
     let agent = ureq::AgentBuilder::new()
@@ -494,7 +562,7 @@ async fn main() -> Result<()> {
     ));
     tokio::spawn(staleness_task(cfg.clone(), state.clone(), alerter.clone()));
     if let Some(url) = cfg.healthcheck_url.clone() {
-        tokio::spawn(heartbeat_task(agent.clone(), url, alerter.clone()));
+        tokio::spawn(heartbeat_task(agent.clone(), url));
     }
 
     let mut sigterm = signal(SignalKind::terminate())?;
