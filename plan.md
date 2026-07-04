@@ -165,11 +165,11 @@ The 60s `STARTUP_GRACE_SECS` in logwatch covers the brief restart window.
 
 ## Risks / notes
 
-- **Dozzle readability:** JSON logs are denser to read by eye in the Dozzle web
-  UI than the current pretty format. Dozzle does pretty-print detected JSON, so
-  this is usually a wash, but worth a look after rollout. If it's annoying, we
-  can keep pretty logs for humans *and* emit JSON — but that means two writers;
-  simpler to accept JSON everywhere.
+- **Dozzle readability:** *not a concern* — Dozzle has automatic JSON detection
+  and color-codes rows by the `level` field, so structured logs render **better**
+  in the Dozzle UI than the current pretty text, not worse. (Verified in the
+  Dozzle docs: "What is Dozzle?" / Alerts & Webhooks.) JSON is Dozzle's preferred
+  format and is what its SQL Engine and alerting operate on.
 - **Third-party / panic lines** won't be JSON; `handle_line` ignores non-JSON
   lines by design. Panics still surface in Dozzle and (because the container
   exits) as a `no 'Flush tick'` staleness alert.
@@ -177,7 +177,75 @@ The 60s `STARTUP_GRACE_SECS` in logwatch covers the brief restart window.
   `"sync pass complete"` message is a breaking change for logwatch — keep them
   in sync (add a comment at each log site pointing at logwatch).
 
+---
+
+## Follow-on (optional): let Dozzle own error alerts, shrink logwatch
+
+Once logs are JSON (above), **Dozzle v10's built-in alerting** can natively
+handle the "loud error" half of logwatch. The guiding split:
+
+> **Dozzle alerts on *presence*** — an incoming log line matched a condition.
+> **logwatch alerts on *absence*** — an expected line/value did not appear or
+> stopped changing. Dozzle structurally cannot do absence (its alerts are
+> triggered *by* a line), so that stays logwatch's job.
+
+### Division of responsibilities
+
+| Signal | Owner after this change |
+|---|---|
+| `WARN`/`ERROR` log lines | **Dozzle** — `Log: level == "error"` (needs JSON) |
+| Container exited (crash/OOM/stop) | **Dozzle** — lifecycle-event alert |
+| Counter frozen (alive but no Binance data) | **logwatch** — absence of change, unique |
+| Heartbeat silence (process hung, container up) | **logwatch** — absence of `flush tick` |
+| Uploader stalled (no `sync pass complete`) | **logwatch** — absence, unique |
+| Host / Docker / Dozzle itself dead | **healthchecks.io** deadman (logwatch pings it) |
+
+### Dozzle setup
+
+- Already on `amir20/dozzle:latest` (v10+), so no image change.
+- **Add a `/data` volume** to the `dozzle` service in `docker-compose.yml` — alert
+  and destination config is stored there and must persist across restarts:
+  ```yaml
+  dozzle:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./dozzle/data:/data          # <-- add: persists alert config
+  ```
+- Configure a Log alert in the Dozzle UI, e.g. `Log: level == "error"` (optionally
+  scoped with `Container: labels["com.docker.compose.service"] in [...]`).
+- Destination: Dozzle has built-in **Slack / Discord / ntfy / custom webhook**,
+  but **no native Telegram**. To keep alerts in the existing Telegram chat, use a
+  **custom webhook** with a Go-template body POSTing to
+  `https://api.telegram.org/bot<token>/sendMessage`. Otherwise ntfy/Slack/Discord
+  are one-click.
+
+### logwatch shrink
+
+Remove the error-forwarding path from `handle_line` (the `level`-based
+`transient` alerts and the `{service}:error` / `{service}:warn` keys). What
+remains is a focused **silence/staleness watcher**:
+
+- collector heartbeat absence (`last_flush_tick`)
+- counter freeze (`last_depth` / `last_depth_change`)
+- uploader sync-pass absence (`last_sync_pass`)
+- the healthchecks.io deadman ping
+
+`handle_line` then only needs `fields.total_depth` (collector) and
+`message == "sync pass complete"` (uploader); the `level` read can go too.
+
+### Trade-off
+
+This splits alerting across two systems (Dozzle UI + logwatch env) — each doing
+what it is best at, but two places to configure. If you prefer a **single
+Telegram integration point**, keep error-forwarding in logwatch as designed and
+simply enjoy Dozzle's nicer JSON rendering without wiring its alerts. Both are
+valid; this section is opt-in.
+
+---
+
 ## Checklist
+
+### Core (JSON migration)
 
 - [ ] `Cargo.toml`: add `json` feature to `tracing-subscriber`
 - [ ] `src/main.rs`: `.json()` on the subscriber
@@ -187,3 +255,11 @@ The 60s `STARTUP_GRACE_SECS` in logwatch covers the brief restart window.
 - [ ] `src/bin/logwatch.rs`: JSON `handle_line`; delete `strip_ansi`/`level_of`/`parse_u64_after`/`Level`
 - [ ] `cargo build --release`
 - [ ] Deploy (`docker compose up -d --build`) and run verification steps
+
+### Optional follow-on (Dozzle-native error alerts)
+
+- [ ] `docker-compose.yml`: add `./dozzle/data:/data` volume to the `dozzle` service
+- [ ] Dozzle UI: create Log alert `level == "error"` (+ container scope if desired)
+- [ ] Dozzle UI: add destination (ntfy/Slack/Discord, or custom webhook → Telegram)
+- [ ] `src/bin/logwatch.rs`: drop the `level`-based error-forwarding from `handle_line`
+- [ ] Verify Dozzle alert fires on a real error; confirm no duplicate from logwatch
