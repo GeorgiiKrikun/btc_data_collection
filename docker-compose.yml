@@ -41,6 +41,34 @@ services:
 
   # --- Observability ---
 
+  # Log watcher. Reads quant2 + uploader logs via the Docker socket (read-only,
+  # like dozzle) and sends a Telegram alert on WARN/ERROR lines, a stalled
+  # collector (no "Flush tick" / frozen depth counter), or a stalled uploader
+  # (no "sync pass complete"). Optionally pings HEALTHCHECK_URL every 60s so you
+  # also get alerted if the whole host or this sidecar dies. See .env.example.
+  logwatch:
+    image: btc_data_collection:latest
+    command: ["./target/release/logwatch"]
+    restart: unless-stopped
+    depends_on:
+      - quant2
+      - uploader
+    env_file:
+      - .env
+    environment:
+      RUST_LOG: ${RUST_LOG:-logwatch=info}
+      COLLECTOR_SERVICE: quant2
+      UPLOADER_SERVICE: uploader
+      # keep in sync with the uploader's UPLOAD_INTERVAL_SECS (alert at ~3x)
+      UPLOADER_MAX_SILENCE_SECS: "900"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   # Web log viewer. Reads logs for every container on the host via the Docker
   # socket (read-only), so quant2 + uploader show up automatically. It has NO
   # published port: it is only reachable through the npm reverse proxy below.

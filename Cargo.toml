@@ -17,6 +17,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
+# logwatch: Docker log streaming over the unix socket (no TLS needed) + a
+# ring-backed HTTPS client for Telegram / healthchecks (no aws-lc / cmake).
+bollard = { version = "0.17", default-features = false }
+ureq = { version = "2", features = ["json"] }
 
 [[bin]]
 name = "quant_2"
@@ -25,3 +29,7 @@ path = "src/main.rs"
 [[bin]]
 name = "uploader"
 path = "src/bin/uploader.rs"
+
+[[bin]]
+name = "logwatch"
+path = "src/bin/logwatch.rs"
