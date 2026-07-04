@@ -181,6 +181,30 @@ enum Level {
     Other,
 }
 
+/// Removes ANSI escape sequences (e.g. `\x1b[32m`). tracing's fmt layer emits
+/// colour codes even when piped, which otherwise breaks level detection and
+/// litters the Telegram messages with `\x1b[` noise.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip a CSI sequence: ESC '[' ... <final letter, e.g. 'm'>
+            if chars.as_str().starts_with('[') {
+                chars.next();
+                for nc in chars.by_ref() {
+                    if nc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// tracing's default fmt output looks like:
 ///   2026-07-04T12:52:00.123Z  INFO quant_2::writer: Flush tick: ...
 fn level_of(line: &str) -> Level {
@@ -314,7 +338,8 @@ async fn stream_logs(
                 buf.push_str(&String::from_utf8_lossy(&output.into_bytes()));
                 while let Some(pos) = buf.find('\n') {
                     let line: String = buf.drain(..=pos).collect();
-                    let line = line.trim_end();
+                    let line = strip_ansi(line.trim_end());
+                    let line = line.trim();
                     if !line.is_empty() {
                         if first {
                             debug!("first log line received from service='{service}': {line}");
