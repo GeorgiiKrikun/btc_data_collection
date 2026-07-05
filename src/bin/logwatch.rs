@@ -47,6 +47,7 @@ struct Config {
     cooldown: Duration,
     startup_grace: Duration,
     check_interval: Duration,
+    healthy_ping: Duration,
 }
 
 fn env_secs(key: &str, default: u64) -> Duration {
@@ -75,6 +76,8 @@ impl Config {
             cooldown: env_secs("ALERT_COOLDOWN_SECS", 300),
             startup_grace: env_secs("STARTUP_GRACE_SECS", 60),
             check_interval: env_secs("CHECK_INTERVAL_SECS", 10),
+            // Periodic "still healthy" confirmation. Default 6h; 0 disables.
+            healthy_ping: env_secs("HEALTHY_PING_SECS", 21600),
         })
     }
 }
@@ -169,96 +172,58 @@ impl Alerter {
             self.send(recovery);
         }
     }
+
+    fn has_active(&self) -> bool {
+        !self.inner.lock().unwrap().active.is_empty()
+    }
+
+    /// Snapshot of the currently-active sticky alert keys (for status summaries).
+    fn active_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.inner.lock().unwrap().active.iter().cloned().collect();
+        keys.sort();
+        keys
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Log line parsing
 // ---------------------------------------------------------------------------
 
-enum Level {
-    Error,
-    Warn,
-    Other,
-}
-
-/// Removes ANSI escape sequences (e.g. `\x1b[32m`). tracing's fmt layer emits
-/// colour codes even when piped, which otherwise breaks level detection and
-/// litters the Telegram messages with `\x1b[` noise.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // Skip a CSI sequence: ESC '[' ... <final letter, e.g. 'm'>
-            if chars.as_str().starts_with('[') {
-                chars.next();
-                for nc in chars.by_ref() {
-                    if nc.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// tracing's default fmt output looks like:
-///   2026-07-04T12:52:00.123Z  INFO quant_2::writer: Flush tick: ...
-fn level_of(line: &str) -> Level {
-    if line.contains(" ERROR ") {
-        Level::Error
-    } else if line.contains(" WARN ") {
-        Level::Warn
-    } else {
-        Level::Other
-    }
-}
-
-/// Reads the run of ASCII digits immediately following `pat`.
-fn parse_u64_after(line: &str, pat: &str) -> Option<u64> {
-    let start = line.find(pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-
+/// Parses one JSON log line (both services log via `tracing_subscriber::fmt().json()`).
+/// The event fields — including the `message` — are nested under `"fields"`.
+/// Non-JSON lines (panics, dependency banners) are ignored.
 fn handle_line(line: &str, kind: Kind, service: &str, state: &Mutex<State>, alerter: &Alerter) {
-    match level_of(line) {
-        Level::Error => alerter.transient(
-            &format!("{service}:error"),
-            format!("🔴 [{service}] {line}"),
-        ),
-        Level::Warn => {
-            alerter.transient(&format!("{service}:warn"), format!("🟠 [{service}] {line}"))
-        }
-        Level::Other => {}
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let level = v["level"].as_str().unwrap_or("");
+    let msg = v["fields"]["message"].as_str().unwrap_or("");
+
+    // Loud failures: forward WARN/ERROR straight to Telegram (debounced).
+    match level {
+        "ERROR" => alerter.transient(&format!("{service}:error"), format!("🔴 [{service}] {msg}")),
+        "WARN" => alerter.transient(&format!("{service}:warn"), format!("🟠 [{service}] {msg}")),
+        _ => {}
     }
 
+    // Heartbeats: presence of specific structured events (see the log-site
+    // comments in writer.rs / uploader.rs — the field/message names are a contract).
     let now = Instant::now();
     let mut st = state.lock().unwrap();
     match kind {
         Kind::Collector => {
-            if line.contains("Flush tick") {
+            if let Some(d) = v["fields"]["total_depth"].as_u64() {
                 st.last_flush_tick = Some(now);
-                if let Some(d) = parse_u64_after(line, "total depth=") {
-                    let advanced = st.last_depth.map_or(true, |prev| d != prev);
-                    if advanced {
-                        st.last_depth = Some(d);
-                        st.last_depth_change = Some(now);
-                    }
-                    debug!("collector heartbeat: total_depth={d} advanced={advanced}");
-                } else {
-                    debug!("collector 'Flush tick' seen but 'total depth=' did not parse");
+                let advanced = st.last_depth.map_or(true, |prev| d != prev);
+                if advanced {
+                    st.last_depth = Some(d);
+                    st.last_depth_change = Some(now);
                 }
+                debug!("collector heartbeat: total_depth={d} advanced={advanced}");
             }
         }
         Kind::Uploader => {
-            if line.contains("sync pass complete") {
+            if msg == "sync pass complete" {
                 st.last_sync_pass = Some(now);
                 debug!("uploader heartbeat: 'sync pass complete' seen");
             }
@@ -338,7 +303,6 @@ async fn stream_logs(
                 buf.push_str(&String::from_utf8_lossy(&output.into_bytes()));
                 while let Some(pos) = buf.find('\n') {
                     let line: String = buf.drain(..=pos).collect();
-                    let line = strip_ansi(line.trim_end());
                     let line = line.trim();
                     if !line.is_empty() {
                         if first {
@@ -474,6 +438,52 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
 }
 
 // ---------------------------------------------------------------------------
+// Periodic "still healthy" confirmation
+// ---------------------------------------------------------------------------
+
+/// Sends a positive status summary every `period` so silence can be trusted as
+/// "all good" rather than "logwatch is broken". Skips the ping while any alert is
+/// active — you're already being told about that — so a green ping is unambiguous.
+async fn healthy_ping_task(period: Duration, state: Arc<Mutex<State>>, alerter: Arc<Alerter>) {
+    let start = Instant::now();
+    let mut ticker = interval(period);
+    ticker.tick().await; // consume the immediate first tick — no ping at t=0
+    loop {
+        ticker.tick().await;
+        if alerter.has_active() {
+            debug!(
+                "healthy ping skipped — active alerts: {:?}",
+                alerter.active_keys()
+            );
+            continue;
+        }
+
+        let now = Instant::now();
+        let (tick_age, depth, pass_age) = {
+            let st = state.lock().unwrap();
+            (
+                st.last_flush_tick.map(|t| now.duration_since(t).as_secs()),
+                st.last_depth,
+                st.last_sync_pass.map(|t| now.duration_since(t).as_secs()),
+            )
+        };
+
+        let collector = match (tick_age, depth) {
+            (Some(a), Some(d)) => format!("collector ok (last tick {a}s ago, depth={d})"),
+            _ => "collector: no data yet".into(),
+        };
+        let uploader = match pass_age {
+            Some(a) => format!("uploader ok (last sync {a}s ago)"),
+            None => "uploader: no sync yet".into(),
+        };
+        let uptime_h = now.duration_since(start).as_secs() / 3600;
+        alerter.send(format!(
+            "🟢 all healthy — {collector}; {uploader}; logwatch up {uptime_h}h"
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Outbound: Telegram + healthcheck heartbeat (ureq, ring-backed rustls)
 // ---------------------------------------------------------------------------
 
@@ -530,7 +540,7 @@ async fn main() -> Result<()> {
 
     let cfg = Arc::new(Config::from_env()?);
     debug!(
-        "config: collector='{}' uploader='{}' flush_max={}s counter_max={}s uploader_max={}s cooldown={}s grace={}s check_every={}s healthcheck={} chat_id={}",
+        "config: collector='{}' uploader='{}' flush_max={}s counter_max={}s uploader_max={}s cooldown={}s grace={}s check_every={}s healthy_ping={}s healthcheck={} chat_id={}",
         cfg.collector_service,
         cfg.uploader_service,
         cfg.flush_max_silence.as_secs(),
@@ -539,6 +549,7 @@ async fn main() -> Result<()> {
         cfg.cooldown.as_secs(),
         cfg.startup_grace.as_secs(),
         cfg.check_interval.as_secs(),
+        cfg.healthy_ping.as_secs(),
         cfg.healthcheck_url.is_some(),
         cfg.chat_id,
     );
@@ -588,6 +599,13 @@ async fn main() -> Result<()> {
     tokio::spawn(staleness_task(cfg.clone(), state.clone(), alerter.clone()));
     if let Some(url) = cfg.healthcheck_url.clone() {
         tokio::spawn(heartbeat_task(agent.clone(), url));
+    }
+    if cfg.healthy_ping > Duration::ZERO {
+        tokio::spawn(healthy_ping_task(
+            cfg.healthy_ping,
+            state.clone(),
+            alerter.clone(),
+        ));
     }
 
     let mut sigterm = signal(SignalKind::terminate())?;

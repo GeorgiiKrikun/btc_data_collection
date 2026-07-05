@@ -218,7 +218,7 @@ async fn sync_once(client: &Client, cfg: &Config, confirmed: &mut HashSet<PathBu
                     Ok(()) => {
                         confirmed.insert(path.clone());
                         uploaded += 1;
-                        info!("uploaded {file_name} ({len} bytes) -> s3://{}/{key}", cfg.bucket);
+                        info!(file = %file_name, bytes = len, bucket = %cfg.bucket, key = %key, "uploaded");
                     }
                     Err(e) => {
                         error!("upload {file_name} failed: {e:#}");
@@ -244,14 +244,15 @@ async fn sync_once(client: &Client, cfg: &Config, confirmed: &mut HashSet<PathBu
         }
     }
 
-    info!(
-        "sync pass complete: {uploaded} uploaded, {deleted} deleted, {in_progress} in-progress (skipped)"
-    );
+    // NOTE: the "sync pass complete" message is a contract consumed by the
+    // `logwatch` binary — keep it in sync.
+    info!(uploaded, deleted, in_progress, "sync pass complete");
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "uploader=info".into()),

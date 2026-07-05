@@ -29,7 +29,15 @@ pub async fn writer_task(
         tokio::select! {
             biased;
             _ = flush_tick.tick() => {
-                info!("Flush tick: depth_buf={}, trade_buf={}, total depth={total_depth}, total trades={total_trades}", depth_buf.len(), trade_buf.len());
+                // NOTE: the `total_depth` field and the "flush tick" message are a
+                // contract consumed by the `logwatch` binary — keep them in sync.
+                info!(
+                    depth_buf = depth_buf.len(),
+                    trade_buf = trade_buf.len(),
+                    total_depth,
+                    total_trades,
+                    "flush tick"
+                );
                 if !depth_buf.is_empty() { flush_depth(&mut depth_buf).await; }
                 if !trade_buf.is_empty() { flush_trades(&mut trade_buf).await; }
             }
@@ -67,7 +75,7 @@ async fn flush_depth(buf: &mut Vec<DepthTick>) {
     let date = Utc::now().format("%Y%m%d").to_string();
     let path = format!("data/depth5_tick_{date}.csv");
     match write_csv_records(&path, records).await {
-        Ok(()) => info!("Wrote {n} depth rows → {path}"),
+        Ok(()) => info!(rows = n, stream = "depth", path = %path, "wrote rows"),
         Err(e) => error!("depth flush error: {e}"),
     }
 }
@@ -78,7 +86,7 @@ async fn flush_trades(buf: &mut Vec<TradeTick>) {
     let date = Utc::now().format("%Y%m%d").to_string();
     let path = format!("data/trades_tick_{date}.csv");
     match write_csv_records(&path, records).await {
-        Ok(()) => info!("Wrote {n} trade rows → {path}"),
+        Ok(()) => info!(rows = n, stream = "trades", path = %path, "wrote rows"),
         Err(e) => error!("trades flush error: {e}"),
     }
 }
