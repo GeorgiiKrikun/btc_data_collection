@@ -61,8 +61,9 @@ services:
       RUST_LOG: ${LOGWATCH_LOG:-logwatch=info}
       COLLECTOR_SERVICE: quant2
       UPLOADER_SERVICE: uploader
-      # keep in sync with the uploader's UPLOAD_INTERVAL_SECS (alert at ~3x)
-      UPLOADER_MAX_SILENCE_SECS: "900"
+      # NOTE: all other tunables (incl. UPLOADER_MAX_SILENCE_SECS — keep it well
+      # above UPLOAD_INTERVAL_SECS) come from .env via env_file above. Do not
+      # hardcode them here: values in `environment:` override `.env`.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     logging:
