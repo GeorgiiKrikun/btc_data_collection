@@ -25,10 +25,12 @@ RUST_LOG=quant_2=debug cargo run --release --bin quant_2
 
 # Run in Docker (collector + uploader + logwatch, production mode, auto-restarts)
 cp .env.example .env   # then fill in S3 creds/bucket
-UID=$(id -u) GID=$(id -g) docker compose up -d
+docker compose up -d --build
 docker compose logs -f
 docker compose down
 ```
+
+Container users: quant2 and uploader run as the image's build-arg user, default UID 1000 / GID 100. `./data` must be writable by it (`chown -R 1000:100 data`), and `secrets/s3_credentials` readable by it. Don't use a `UID=$(id -u) …` prefix: `UID` is a read-only variable in bash. To build for another user, pass `docker compose build --build-arg UID=… --build-arg GID=…`. logwatch runs as root (`user: "0:0"` in compose) because it needs the Docker socket.
 
 ## Architecture
 

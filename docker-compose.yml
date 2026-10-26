@@ -52,6 +52,11 @@ services:
   logwatch:
     image: btc_data_collection:latest
     command: ["./target/release/logwatch"]
+    # The Docker socket is root:docker 0660, so the image's default user
+    # (UID 1000) can't open it. Socket access is root-equivalent anyway, so
+    # running this read-only log reader as root grants nothing extra (dozzle
+    # runs as root too). It writes no files.
+    user: "0:0"
     restart: unless-stopped
     depends_on:
       - quant2
