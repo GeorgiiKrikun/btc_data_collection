@@ -348,7 +348,9 @@ async fn stream_logs(
 }
 
 /// Discovers containers for a compose service and keeps one streaming task per
-/// container id. A restart yields a new id, which the next poll picks up.
+/// container id. A recreated container has a new id, which the next poll picks
+/// up. A `docker compose restart` keeps the id but ends the log stream, so an id
+/// is forgotten when its stream closes and re-attached on the next poll.
 async fn watch_service(
     docker: Docker,
     service: String,
@@ -356,7 +358,7 @@ async fn watch_service(
     state: Arc<Mutex<State>>,
     alerter: Arc<Alerter>,
 ) {
-    let mut tracked: HashSet<String> = HashSet::new();
+    let tracked: Arc<Mutex<HashSet<String>>> = Arc::default();
     let mut warned_empty = false;
     loop {
         match list_ids(&docker, &service).await {
@@ -371,16 +373,21 @@ async fn watch_service(
                 } else {
                     warned_empty = false;
                     for (id, name) in found {
-                        if tracked.insert(id.clone()) {
+                        if tracked.lock().unwrap().insert(id.clone()) {
                             info!("watching container '{name}' for service='{service}'");
-                            tokio::spawn(stream_logs(
+                            let stream = stream_logs(
                                 docker.clone(),
-                                id,
+                                id.clone(),
                                 kind,
                                 service.clone(),
                                 state.clone(),
                                 alerter.clone(),
-                            ));
+                            );
+                            let tracked = tracked.clone();
+                            tokio::spawn(async move {
+                                stream.await;
+                                tracked.lock().unwrap().remove(&id);
+                            });
                         }
                     }
                 }
