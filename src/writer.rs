@@ -1,93 +1,94 @@
-use crate::models::{DepthTick, TradeTick};
+use crate::models::{Market, Record, Row};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_THRESHOLD: usize = 500;
 
-pub async fn writer_task(
-    mut depth_rx: mpsc::Receiver<DepthTick>,
-    mut trade_rx: mpsc::Receiver<TradeTick>,
-) {
-    let mut depth_buf: Vec<DepthTick> = Vec::with_capacity(FLUSH_THRESHOLD);
-    let mut trade_buf: Vec<TradeTick> = Vec::with_capacity(FLUSH_THRESHOLD);
+/// One output file family: `data/kraken/<market>/<instrument>/<stream>_YYYYMMDD.csv`.
+type BufKey = (Market, Arc<str>, &'static str);
+
+#[derive(Default)]
+struct Counters {
+    depth: u64,
+    trades: u64,
+    ticker: u64,
+}
+
+pub async fn writer_task(mut rx: mpsc::Receiver<Record>, markets: Vec<Market>) {
+    let mut bufs: HashMap<BufKey, Vec<Row>> = HashMap::new();
+    let mut counters: HashMap<Market, Counters> =
+        markets.iter().map(|m| (*m, Counters::default())).collect();
     let mut flush_tick = interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
     flush_tick.tick().await; // consume the immediate first tick
-    let mut depth_closed = false;
-    let mut trade_closed = false;
-    let mut total_depth: u64 = 0;
-    let mut total_trades: u64 = 0;
 
     loop {
-        if depth_closed && trade_closed {
-            break;
-        }
-
         tokio::select! {
             biased;
             _ = flush_tick.tick() => {
-                // NOTE: the `total_depth` field and the "flush tick" message are a
-                // contract consumed by the `logwatch` binary — keep them in sync.
-                info!(
-                    depth_buf = depth_buf.len(),
-                    trade_buf = trade_buf.len(),
-                    total_depth,
-                    total_trades,
-                    "flush tick"
-                );
-                if !depth_buf.is_empty() { flush_depth(&mut depth_buf).await; }
-                if !trade_buf.is_empty() { flush_trades(&mut trade_buf).await; }
+                // NOTE: the `total_depth` field, the "flush tick" message and the
+                // per-market "market tick" events are a contract consumed by the
+                // `logwatch` binary — keep them in sync.
+                let total_depth: u64 = counters.values().map(|c| c.depth).sum();
+                let total_trades: u64 = counters.values().map(|c| c.trades).sum();
+                let buffered: usize = bufs.values().map(Vec::len).sum();
+                info!(buffered, total_depth, total_trades, "flush tick");
+                for m in &markets {
+                    let c = &counters[m];
+                    info!(market = m.as_str(), depth = c.depth, trades = c.trades, ticker = c.ticker, "market tick");
+                }
+                flush_all(&mut bufs).await;
             }
-            msg = depth_rx.recv(), if !depth_closed => match msg {
-                Some(tick) => {
-                    total_depth += 1;
-                    depth_buf.push(tick);
-                    if depth_buf.len() >= FLUSH_THRESHOLD {
-                        flush_depth(&mut depth_buf).await;
+            msg = rx.recv() => match msg {
+                Some(rec) => {
+                    let c = counters.entry(rec.market).or_default();
+                    match rec.row {
+                        Row::Depth(_) => c.depth += 1,
+                        Row::SpotTrade(_) | Row::FutTrade(_) => c.trades += 1,
+                        Row::Ticker(_) => c.ticker += 1,
+                    }
+                    let key = (rec.market, rec.instrument, rec.row.stream());
+                    let buf = bufs.entry(key.clone()).or_default();
+                    buf.push(rec.row);
+                    if buf.len() >= FLUSH_THRESHOLD {
+                        let records = std::mem::take(buf);
+                        flush(&key, records).await;
                     }
                 }
-                None => { depth_closed = true; }
-            },
-            msg = trade_rx.recv(), if !trade_closed => match msg {
-                Some(tick) => {
-                    total_trades += 1;
-                    trade_buf.push(tick);
-                    if trade_buf.len() >= FLUSH_THRESHOLD {
-                        flush_trades(&mut trade_buf).await;
-                    }
-                }
-                None => { trade_closed = true; }
+                None => break,
             },
         }
     }
 
-    if !depth_buf.is_empty() { flush_depth(&mut depth_buf).await; }
-    if !trade_buf.is_empty() { flush_trades(&mut trade_buf).await; }
+    flush_all(&mut bufs).await;
     info!("Writer flushed and exiting");
 }
 
-async fn flush_depth(buf: &mut Vec<DepthTick>) {
-    let records = std::mem::take(buf);
-    let n = records.len();
-    let date = Utc::now().format("%Y%m%d").to_string();
-    let path = format!("data/depth5_tick_{date}.csv");
-    match write_csv_records(&path, records).await {
-        Ok(()) => info!(rows = n, stream = "depth", path = %path, "wrote rows"),
-        Err(e) => error!("depth flush error: {e}"),
+async fn flush_all(bufs: &mut HashMap<BufKey, Vec<Row>>) {
+    for (key, buf) in bufs.iter_mut() {
+        if !buf.is_empty() {
+            flush(key, std::mem::take(buf)).await;
+        }
     }
 }
 
-async fn flush_trades(buf: &mut Vec<TradeTick>) {
-    let records = std::mem::take(buf);
+async fn flush((market, instrument, stream): &BufKey, records: Vec<Row>) {
     let n = records.len();
     let date = Utc::now().format("%Y%m%d").to_string();
-    let path = format!("data/trades_tick_{date}.csv");
-    match write_csv_records(&path, records).await {
-        Ok(()) => info!(rows = n, stream = "trades", path = %path, "wrote rows"),
-        Err(e) => error!("trades flush error: {e}"),
+    let dir = format!("data/kraken/{}/{instrument}", market.as_str());
+    let path = format!("{dir}/{stream}_{date}.csv");
+    let result = match tokio::fs::create_dir_all(&dir).await {
+        Ok(()) => write_csv_records(&path, records).await,
+        Err(e) => Err(e.into()),
+    };
+    match result {
+        Ok(()) => debug!(rows = n, path = %path, "wrote rows"),
+        Err(e) => error!("flush error for {path}: {e}"),
     }
 }
 

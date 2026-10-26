@@ -2,7 +2,7 @@
 //! S3-compatible object store (AWS S3, Hetzner Object Storage, MinIO, ...)
 //! and prunes old local copies once they are safely in the bucket.
 //!
-//! Runs as a standalone service. Every `UPLOAD_INTERVAL_SECS` it scans the
+//! Runs as a standalone service. Every `UPLOAD_INTERVAL_SECS` it recursively scans the
 //! data directory and:
 //!   1. Uploads only *finalized* files — those whose embedded date
 //!      (`..._YYYYMMDD.csv`) is before the current UTC day. The current day's
@@ -17,7 +17,8 @@
 //!   S3_BUCKET            (required)  target bucket name
 //!   S3_ENDPOINT_URL      (optional)  e.g. https://fsn1.your-objectstorage.com for Hetzner
 //!   S3_REGION            (optional)  region string; defaults to AWS_REGION or "us-east-1"
-//!   S3_PREFIX            (optional)  key prefix, e.g. "btcusdt" -> btcusdt/<file>.csv
+//!   S3_PREFIX            (optional)  key prefix; keys are <prefix>/<path relative to DATA_DIR>,
+//!                                    e.g. kraken/spot/btc_usd/trades_tick_20261027.csv
 //!   S3_FORCE_PATH_STYLE  (optional)  "true" to use path-style addressing
 //!   DATA_DIR             (optional)  directory to upload, default "data"
 //!   UPLOAD_INTERVAL_SECS (optional)  scan interval, default 300
@@ -96,11 +97,11 @@ async fn build_client(cfg: &Config) -> Client {
     Client::from_conf(s3_cfg.build())
 }
 
-fn object_key(prefix: &str, file_name: &str) -> String {
+fn object_key(prefix: &str, rel_path: &str) -> String {
     if prefix.is_empty() {
-        file_name.to_string()
+        rel_path.to_string()
     } else {
-        format!("{prefix}/{file_name}")
+        format!("{prefix}/{rel_path}")
     }
 }
 
@@ -146,41 +147,71 @@ async fn upload_file(client: &Client, bucket: &str, key: &str, path: &Path) -> R
     Ok(())
 }
 
+/// Recursively lists the `.csv` files under `root`, each with its path relative
+/// to `root` using `/` separators (e.g. `kraken/spot/btc_usd/trades_tick_20261027.csv`).
+/// Returns `None` if `root` itself can't be read.
+async fn list_csv_files(root: &Path) -> Option<Vec<(PathBuf, String)>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir_path) = pending.pop() {
+        let mut dir = match tokio::fs::read_dir(&dir_path).await {
+            Ok(d) => d,
+            Err(e) if dir_path == root => {
+                error!("cannot read data dir {}: {e}", root.display());
+                return None;
+            }
+            Err(e) => {
+                warn!("cannot read {}: {e}", dir_path.display());
+                continue;
+            }
+        };
+        loop {
+            let entry = match dir.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => {
+                    error!("error iterating {}: {e}", dir_path.display());
+                    break;
+                }
+            };
+            let path = entry.path();
+            match entry.file_type().await {
+                Ok(t) if t.is_dir() => pending.push(path),
+                Ok(t) if t.is_file() && path.extension().is_some_and(|x| x == "csv") => {
+                    let Ok(rel) = path.strip_prefix(root) else { continue };
+                    let rel = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    files.push((path, rel));
+                }
+                Ok(_) => {}
+                Err(e) => warn!("stat {}: {e}", path.display()),
+            }
+        }
+    }
+    Some(files)
+}
+
 /// One sync pass. `confirmed` holds paths we know are present in the bucket, so
 /// repeated passes skip the HeadObject/PutObject round-trips for them.
 async fn sync_once(client: &Client, cfg: &Config, confirmed: &mut HashSet<PathBuf>) {
     let today = Utc::now().date_naive();
 
-    let mut dir = match tokio::fs::read_dir(&cfg.data_dir).await {
-        Ok(d) => d,
-        Err(e) => {
-            error!("cannot read data dir {}: {e}", cfg.data_dir);
-            return;
-        }
+    let Some(files) = list_csv_files(Path::new(&cfg.data_dir)).await else {
+        return;
     };
 
     let mut uploaded = 0u32;
     let mut deleted = 0u32;
     let mut in_progress = 0u32;
 
-    loop {
-        let entry = match dir.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(e) => {
-                error!("error iterating data dir: {e}");
-                break;
-            }
-        };
+    for (path, rel_path) in files {
+        let file_name = rel_path.rsplit('/').next().unwrap_or(&rel_path);
 
-        let path = entry.path();
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if n.ends_with(".csv") => n.to_string(),
-            _ => continue,
-        };
-
-        let Some(file_date) = parse_file_date(&file_name) else {
-            warn!("skipping {file_name}: no parseable date in name");
+        let Some(file_date) = parse_file_date(file_name) else {
+            warn!("skipping {rel_path}: no parseable date in name");
             continue;
         };
 
@@ -191,23 +222,21 @@ async fn sync_once(client: &Client, cfg: &Config, confirmed: &mut HashSet<PathBu
             continue;
         }
 
-        let meta = match entry.metadata().await {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => continue,
+        let len = match tokio::fs::metadata(&path).await {
+            Ok(m) => m.len(),
             Err(e) => {
-                warn!("stat {file_name}: {e}");
+                warn!("stat {rel_path}: {e}");
                 continue;
             }
         };
-        let len = meta.len();
-        let key = object_key(&cfg.prefix, &file_name);
+        let key = object_key(&cfg.prefix, &rel_path);
 
         // Ensure the file is in the bucket (upload once).
         if !confirmed.contains(&path) {
             let present = match object_present(client, &cfg.bucket, &key, len).await {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("head {file_name} failed: {e:#}");
+                    error!("head {rel_path} failed: {e:#}");
                     continue;
                 }
             };
@@ -218,10 +247,10 @@ async fn sync_once(client: &Client, cfg: &Config, confirmed: &mut HashSet<PathBu
                     Ok(()) => {
                         confirmed.insert(path.clone());
                         uploaded += 1;
-                        info!(file = %file_name, bytes = len, bucket = %cfg.bucket, key = %key, "uploaded");
+                        info!(file = %rel_path, bytes = len, bucket = %cfg.bucket, key = %key, "uploaded");
                     }
                     Err(e) => {
-                        error!("upload {file_name} failed: {e:#}");
+                        error!("upload {rel_path} failed: {e:#}");
                         continue;
                     }
                 }
@@ -236,9 +265,9 @@ async fn sync_once(client: &Client, cfg: &Config, confirmed: &mut HashSet<PathBu
                     Ok(()) => {
                         confirmed.remove(&path);
                         deleted += 1;
-                        info!("deleted local {file_name} (age {age}d > {}d)", cfg.retention_days);
+                        info!("deleted local {rel_path} (age {age}d > {}d)", cfg.retention_days);
                     }
-                    Err(e) => warn!("delete {file_name} failed: {e}"),
+                    Err(e) => warn!("delete {rel_path} failed: {e}"),
                 }
             }
         }

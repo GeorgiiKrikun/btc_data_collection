@@ -7,6 +7,9 @@ services:
         GID: ${GID:-100}
     image: btc_data_collection:latest
     restart: unless-stopped
+    # ASSETS / MARKETS (optional; defaults in src/config.rs) come from .env.
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data
     logging:

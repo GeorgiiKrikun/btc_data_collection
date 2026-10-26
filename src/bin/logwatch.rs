@@ -5,8 +5,10 @@
 //! Telegram message when something looks wrong. It watches for:
 //!
 //!   * collector: any WARN/ERROR line (loud failures)
-//!   * collector: absence of the every-5s "Flush tick" line  -> process dead/hung
-//!   * collector: the "total depth=" counter not advancing    -> connected but no data
+//!   * collector: absence of the every-5s "flush tick" event  -> process dead/hung
+//!   * collector: the `total_depth` counter not advancing     -> connected but no data
+//!   * collector: a per-market "market tick" counter frozen    -> one Kraken socket
+//!                (spot or futures) down while the other still flows
 //!   * uploader:  any WARN/ERROR line (S3 down, bad creds, ...)
 //!   * uploader:  absence of "sync pass complete" for too long -> uploader stuck/dead
 //!
@@ -86,12 +88,21 @@ impl Config {
 // Shared state — updated by log tasks, read by the staleness task
 // ---------------------------------------------------------------------------
 
+/// Per-market counters from the collector's "market tick" events that must keep
+/// advancing. Each one maps to one exchange socket: spot depth (spot WS), futures
+/// depth (futures book) and futures ticker (pushed every second per product, so
+/// it is never legitimately quiet).
+const WATCHED_COUNTERS: &[(&str, &str)] =
+    &[("spot", "depth"), ("futures", "depth"), ("futures", "ticker")];
+
 #[derive(Default)]
 struct State {
     last_flush_tick: Option<Instant>,
     last_depth: Option<u64>,
     last_depth_change: Option<Instant>,
     last_sync_pass: Option<Instant>,
+    /// (market, field) -> (last value, when it last changed)
+    counters: HashMap<(String, &'static str), (u64, Instant)>,
 }
 
 #[derive(Clone, Copy)]
@@ -220,6 +231,19 @@ fn handle_line(line: &str, kind: Kind, service: &str, state: &Mutex<State>, aler
                     st.last_depth_change = Some(now);
                 }
                 debug!("collector heartbeat: total_depth={d} advanced={advanced}");
+            }
+            if msg == "market tick" {
+                let market = v["fields"]["market"].as_str().unwrap_or("?").to_string();
+                for &(m, field) in WATCHED_COUNTERS {
+                    if m != market {
+                        continue;
+                    }
+                    let Some(value) = v["fields"][field].as_u64() else { continue };
+                    let entry = st.counters.entry((market.clone(), field)).or_insert((value, now));
+                    if entry.0 != value {
+                        *entry = (value, now);
+                    }
+                }
             }
         }
         Kind::Uploader => {
@@ -381,12 +405,13 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
             continue;
         }
 
-        let (last_tick, last_change, last_pass) = {
+        let (last_tick, last_change, last_pass, counters) = {
             let st = state.lock().unwrap();
             (
                 st.last_flush_tick.unwrap_or(start),
                 st.last_depth_change.unwrap_or(start),
                 st.last_sync_pass.unwrap_or(start),
+                st.counters.clone(),
             )
         };
 
@@ -416,11 +441,27 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
                 "collector:counter",
                 stale,
                 format!(
-                    "🔴 [collector] depth counter frozen for {}s — connected but NO data from Binance",
+                    "🔴 [collector] depth counter frozen for {}s — connected but NO data from Kraken",
                     now.duration_since(last_change).as_secs()
                 ),
                 "🟢 [collector] data flow resumed".into(),
             );
+
+            // Per-socket flow: one market can die while the other keeps the
+            // total counter moving. Markets the collector doesn't run never
+            // appear in `counters` and are not checked.
+            for ((market, field), (_, changed)) in &counters {
+                let age = now.duration_since(*changed);
+                alerter.sticky(
+                    &format!("collector:{market}:{field}"),
+                    age > cfg.counter_max_stale,
+                    format!(
+                        "🔴 [collector] {market} {field} counter frozen for {}s — that Kraken feed is down",
+                        age.as_secs()
+                    ),
+                    format!("🟢 [collector] {market} {field} flow resumed"),
+                );
+            }
         }
 
         // Uploader still completing sync passes?
@@ -459,17 +500,25 @@ async fn healthy_ping_task(period: Duration, state: Arc<Mutex<State>>, alerter: 
         }
 
         let now = Instant::now();
-        let (tick_age, depth, pass_age) = {
+        let (tick_age, depth, pass_age, mut counters) = {
             let st = state.lock().unwrap();
             (
                 st.last_flush_tick.map(|t| now.duration_since(t).as_secs()),
                 st.last_depth,
                 st.last_sync_pass.map(|t| now.duration_since(t).as_secs()),
+                st.counters
+                    .iter()
+                    .map(|((m, f), (v, _))| format!("{m}.{f}={v}"))
+                    .collect::<Vec<_>>(),
             )
         };
+        counters.sort();
 
         let collector = match (tick_age, depth) {
-            (Some(a), Some(d)) => format!("collector ok (last tick {a}s ago, depth={d})"),
+            (Some(a), Some(d)) => format!(
+                "collector ok (last tick {a}s ago, depth={d}; {})",
+                counters.join(", ")
+            ),
             _ => "collector: no data yet".into(),
         };
         let uploader = match pass_age {
@@ -615,4 +664,26 @@ async fn main() -> Result<()> {
     }
     info!("logwatch shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_tick_tracks_only_watched_counters() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let alerter = Alerter::new(tx, Duration::from_secs(300));
+        let state = Mutex::new(State::default());
+        // A real event as emitted by writer.rs.
+        let line = r#"{"timestamp":"2026-10-26T16:56:05.465671Z","level":"INFO","fields":{"message":"market tick","market":"futures","depth":80,"trades":6,"ticker":25},"target":"quant_2::writer"}"#;
+        handle_line(line, Kind::Collector, "quant2", &state, &alerter);
+
+        let st = state.lock().unwrap();
+        let get = |m: &str, f: &'static str| st.counters.get(&(m.to_string(), f)).map(|c| c.0);
+        assert_eq!(get("futures", "depth"), Some(80));
+        assert_eq!(get("futures", "ticker"), Some(25));
+        assert_eq!(get("futures", "trades"), None, "trades can be legitimately quiet");
+        assert_eq!(get("spot", "depth"), None, "spot not seen yet");
+    }
 }
