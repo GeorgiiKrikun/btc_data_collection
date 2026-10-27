@@ -210,10 +210,15 @@ fn handle_line(line: &str, kind: Kind, service: &str, state: &Mutex<State>, aler
     let level = v["level"].as_str().unwrap_or("");
     let msg = v["fields"]["message"].as_str().unwrap_or("");
 
-    // Loud failures: forward WARN/ERROR straight to Telegram (debounced).
+    // Loud failures: forward WARN/ERROR straight to Telegram (debounced). The
+    // collector tags per-exchange-connection events with a `market` field.
+    let tag = match v["fields"]["market"].as_str() {
+        Some(market) => format!("{service}/{market}"),
+        None => service.to_string(),
+    };
     match level {
-        "ERROR" => alerter.transient(&format!("{service}:error"), format!("🔴 [{service}] {msg}")),
-        "WARN" => alerter.transient(&format!("{service}:warn"), format!("🟠 [{service}] {msg}")),
+        "ERROR" => alerter.transient(&format!("{service}:error"), format!("🔴 [{tag}] {msg}")),
+        "WARN" => alerter.transient(&format!("{service}:warn"), format!("🟠 [{tag}] {msg}")),
         _ => {}
     }
 

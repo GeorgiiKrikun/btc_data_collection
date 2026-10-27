@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info};
 
 mod book;
@@ -75,20 +75,45 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Runs one exchange connection forever: reconnects immediately after a clean
-/// close and 5s after an error.
+/// A session that lasted at least this long counts as healthy, so its failure
+/// is treated as a routine drop rather than part of a failure streak.
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// Consecutive failures before a disconnect is logged at ERROR (and alerted on).
+const ALERT_AFTER_FAILURES: u32 = 3;
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Runs one exchange connection forever. A clean close reconnects
+/// immediately. After an error the delay starts at 1s and doubles on each
+/// consecutive failure (up to 30s). Exchanges drop long-lived connections now
+/// and then, so a drop after a healthy session is logged at INFO. Only
+/// repeated failures are logged at ERROR, which logwatch forwards to Telegram.
+/// Longer outages are also caught by logwatch's frozen-counter alerts.
 fn spawn_connection<F, Fut>(market: Market, mut connect: F) -> JoinHandle<()>
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send,
 {
     tokio::spawn(async move {
+        let mut failures: u32 = 0;
         loop {
-            match connect().await {
+            let started = Instant::now();
+            let result = connect().await;
+            let uptime = started.elapsed();
+            if uptime >= HEALTHY_SESSION {
+                failures = 0;
+            }
+            match result {
                 Ok(()) => info!(market = market.as_str(), "WebSocket closed cleanly, reconnecting immediately..."),
                 Err(e) => {
-                    error!(market = market.as_str(), "WebSocket error: {e:#}, reconnecting in 5s");
-                    sleep(Duration::from_secs(5)).await;
+                    failures += 1;
+                    let delay = Duration::from_secs(1 << (failures - 1).min(5)).min(MAX_BACKOFF);
+                    let up = uptime.as_secs();
+                    if failures >= ALERT_AFTER_FAILURES {
+                        error!(market = market.as_str(), failures, "WebSocket error: {e:#} ({failures} consecutive failures), reconnecting in {}s", delay.as_secs());
+                    } else {
+                        info!(market = market.as_str(), uptime_secs = up, "WebSocket dropped after {up}s: {e:#}, reconnecting in {}s", delay.as_secs());
+                    }
+                    sleep(delay).await;
                 }
             }
         }
