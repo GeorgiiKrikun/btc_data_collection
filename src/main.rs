@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info};
 
+mod binance;
 mod book;
 mod config;
 mod kraken_futures;
@@ -13,6 +14,7 @@ mod kraken_spot;
 mod models;
 mod writer;
 
+use binance::Feed;
 use models::{Market, Record};
 
 #[tokio::main]
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
         markets = ?cfg.markets,
         spot = ?cfg.spot.iter().map(|i| &i.wire).collect::<Vec<_>>(),
         futures = ?cfg.futures.iter().map(|i| &i.wire).collect::<Vec<_>>(),
-        "Collector starting — output in ./data/kraken/"
+        "Collector starting — output in ./data/"
     );
 
     let (tx, rx) = mpsc::channel::<Record>(65_536);
@@ -43,17 +45,25 @@ async fn main() -> Result<()> {
     let mut collectors = Vec::new();
     for market in &cfg.markets {
         let tx = tx.clone();
-        let handle = match market {
-            Market::Spot => {
+        match market {
+            Market::KrakenSpot => {
                 let instruments: Arc<[_]> = cfg.spot.clone().into();
-                spawn_connection(*market, move || kraken_spot::run(instruments.clone(), tx.clone()))
+                collectors.push(spawn_connection(market.as_str(), move || {
+                    kraken_spot::run(instruments.clone(), tx.clone())
+                }));
             }
-            Market::Futures => {
+            Market::KrakenFutures => {
                 let instruments: Arc<[_]> = cfg.futures.clone().into();
-                spawn_connection(*market, move || kraken_futures::run(instruments.clone(), tx.clone()))
+                collectors.push(spawn_connection(market.as_str(), move || {
+                    kraken_futures::run(instruments.clone(), tx.clone())
+                }));
             }
-        };
-        collectors.push(handle);
+            Market::BinanceSpot => collectors.push(spawn_binance(Feed::Spot, tx)),
+            Market::BinanceFutures => {
+                collectors.push(spawn_binance(Feed::FuturesPublic, tx.clone()));
+                collectors.push(spawn_binance(Feed::FuturesMarket, tx));
+            }
+        }
     }
     // Only the collector tasks hold senders now, so aborting them ends the writer.
     drop(tx);
@@ -88,7 +98,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// and then, so a drop after a healthy session is logged at INFO. Only
 /// repeated failures are logged at ERROR, which logwatch forwards to Telegram.
 /// Longer outages are also caught by logwatch's frozen-counter alerts.
-fn spawn_connection<F, Fut>(market: Market, mut connect: F) -> JoinHandle<()>
+fn spawn_connection<F, Fut>(name: &'static str, mut connect: F) -> JoinHandle<()>
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send,
@@ -103,19 +113,23 @@ where
                 failures = 0;
             }
             match result {
-                Ok(()) => info!(market = market.as_str(), "WebSocket closed cleanly, reconnecting immediately..."),
+                Ok(()) => info!(market = name, "WebSocket closed cleanly, reconnecting immediately..."),
                 Err(e) => {
                     failures += 1;
                     let delay = Duration::from_secs(1 << (failures - 1).min(5)).min(MAX_BACKOFF);
                     let up = uptime.as_secs();
                     if failures >= ALERT_AFTER_FAILURES {
-                        error!(market = market.as_str(), failures, "WebSocket error: {e:#} ({failures} consecutive failures), reconnecting in {}s", delay.as_secs());
+                        error!(market = name, failures, "WebSocket error: {e:#} ({failures} consecutive failures), reconnecting in {}s", delay.as_secs());
                     } else {
-                        info!(market = market.as_str(), uptime_secs = up, "WebSocket dropped after {up}s: {e:#}, reconnecting in {}s", delay.as_secs());
+                        info!(market = name, uptime_secs = up, "WebSocket dropped after {up}s: {e:#}, reconnecting in {}s", delay.as_secs());
                     }
                     sleep(delay).await;
                 }
             }
         }
     })
+}
+
+fn spawn_binance(feed: Feed, tx: mpsc::Sender<Record>) -> JoinHandle<()> {
+    spawn_connection(feed.name(), move || binance::run(feed, tx.clone()))
 }

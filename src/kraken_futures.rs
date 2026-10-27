@@ -34,7 +34,7 @@ struct Tracked {
 
 pub async fn run(instruments: Arc<[Instrument]>, tx: mpsc::Sender<Record>) -> Result<()> {
     let (ws_stream, _) = connect_async(WS_URL).await?;
-    info!(market = "futures", "Connected to Kraken Futures WebSocket");
+    info!(market = "kraken_futures", "Connected to Kraken Futures WebSocket");
     let (mut write, mut read) = ws_stream.split();
 
     let products: Vec<&str> = instruments.iter().map(|i| i.wire.as_str()).collect();
@@ -71,7 +71,7 @@ pub async fn run(instruments: Arc<[Instrument]>, tx: mpsc::Sender<Record>) -> Re
                             if e.is::<Desync>() {
                                 return Err(e);
                             }
-                            warn!(market = "futures", "Message error: {e:#}");
+                            warn!(market = "kraken_futures", "Message error: {e:#}");
                         }
                     }
                     Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
@@ -87,7 +87,7 @@ pub async fn run(instruments: Arc<[Instrument]>, tx: mpsc::Sender<Record>) -> Re
                 let recv_ts_us = Utc::now().timestamp_micros();
                 for t in books.values_mut() {
                     if let Some(tick) = t.book.take_sample(recv_ts_us) {
-                        let rec = Record { market: Market::Futures, instrument: t.instrument.clone(), row: Row::Depth(tick) };
+                        let rec = Record { market: Market::KrakenFutures, instrument: t.instrument.clone(), row: Row::Depth(tick) };
                         let _ = tx.send(rec).await;
                     }
                 }
@@ -107,11 +107,11 @@ async fn handle_message(
 
     if let Some(event) = head.event {
         match event {
-            "subscribed" => debug!(market = "futures", "subscribed: {text}"),
+            "subscribed" => debug!(market = "kraken_futures", "subscribed: {text}"),
             "error" | "subscribed_failed" => {
-                error!(market = "futures", "subscribe failed: {text}")
+                error!(market = "kraken_futures", "subscribe failed: {text}")
             }
-            _ => debug!(market = "futures", "event: {text}"),
+            _ => debug!(market = "kraken_futures", "event: {text}"),
         }
         return Ok(());
     }
@@ -156,7 +156,7 @@ async fn handle_message(
                 side: d.side,
                 trade_type: d.trade_type,
             };
-            let rec = Record { market: Market::Futures, instrument: t.instrument.clone(), row: Row::FutTrade(tick) };
+            let rec = Record { market: Market::KrakenFutures, instrument: t.instrument.clone(), row: Row::FutTrade(tick) };
             let _ = tx.send(rec).await;
         }
         Some("ticker") => {
@@ -181,7 +181,7 @@ async fn handle_message(
                 open_interest: d.open_interest,
                 volume_24h: d.volume,
             };
-            let rec = Record { market: Market::Futures, instrument: t.instrument.clone(), row: Row::Ticker(tick) };
+            let rec = Record { market: Market::KrakenFutures, instrument: t.instrument.clone(), row: Row::Ticker(tick) };
             let _ = tx.send(rec).await;
         }
         // "trade_snapshot" (recent history, would duplicate rows across

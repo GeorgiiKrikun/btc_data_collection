@@ -7,8 +7,8 @@
 //!   * collector: any WARN/ERROR line (loud failures)
 //!   * collector: absence of the every-5s "flush tick" event  -> process dead/hung
 //!   * collector: the `total_depth` counter not advancing     -> connected but no data
-//!   * collector: a per-market "market tick" counter frozen    -> one Kraken socket
-//!                (spot or futures) down while the other still flows
+//!   * collector: a per-market "market tick" counter frozen    -> one exchange socket
+//!                (Kraken/Binance spot or futures) down while the others still flow
 //!   * uploader:  any WARN/ERROR line (S3 down, bad creds, ...)
 //!   * uploader:  absence of "sync pass complete" for too long -> uploader stuck/dead
 //!
@@ -89,11 +89,19 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 /// Per-market counters from the collector's "market tick" events that must keep
-/// advancing. Each one maps to one exchange socket: spot depth (spot WS), futures
-/// depth (futures book) and futures ticker (pushed every second per product, so
-/// it is never legitimately quiet).
-const WATCHED_COUNTERS: &[(&str, &str)] =
-    &[("spot", "depth"), ("futures", "depth"), ("futures", "ticker")];
+/// advancing. Each one is fed by a stream that is never legitimately quiet:
+/// depth (every 100ms), the Kraken futures ticker and the Binance futures mark
+/// price (every second). Binance futures depth and mark price come from two
+/// different sockets (`/public` and `/market`), so each socket is covered.
+/// Trades and liquidations can be quiet and are not watched.
+const WATCHED_COUNTERS: &[(&str, &str)] = &[
+    ("kraken_spot", "depth"),
+    ("kraken_futures", "depth"),
+    ("kraken_futures", "ticker"),
+    ("binance_spot", "depth"),
+    ("binance_futures", "depth"),
+    ("binance_futures", "mark_price"),
+];
 
 #[derive(Default)]
 struct State {
@@ -453,7 +461,7 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
                 "collector:counter",
                 stale,
                 format!(
-                    "🔴 [collector] depth counter frozen for {}s — connected but NO data from Kraken",
+                    "🔴 [collector] depth counter frozen for {}s — connected but NO data from any exchange",
                     now.duration_since(last_change).as_secs()
                 ),
                 "🟢 [collector] data flow resumed".into(),
@@ -468,7 +476,7 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
                     &format!("collector:{market}:{field}"),
                     age > cfg.counter_max_stale,
                     format!(
-                        "🔴 [collector] {market} {field} counter frozen for {}s — that Kraken feed is down",
+                        "🔴 [collector] {market} {field} counter frozen for {}s — that exchange feed is down",
                         age.as_secs()
                     ),
                     format!("🟢 [collector] {market} {field} flow resumed"),
@@ -687,15 +695,22 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let alerter = Alerter::new(tx, Duration::from_secs(300));
         let state = Mutex::new(State::default());
-        // A real event as emitted by writer.rs.
-        let line = r#"{"timestamp":"2026-10-26T16:56:05.465671Z","level":"INFO","fields":{"message":"market tick","market":"futures","depth":80,"trades":6,"ticker":25},"target":"quant_2::writer"}"#;
-        handle_line(line, Kind::Collector, "quant2", &state, &alerter);
+        // Events as emitted by writer.rs.
+        let kraken = r#"{"timestamp":"2026-10-27T16:56:05.465671Z","level":"INFO","fields":{"message":"market tick","market":"kraken_futures","depth":80,"trades":6,"ticker":25,"mark_price":0,"liquidations":0},"target":"quant_2::writer"}"#;
+        let binance = r#"{"timestamp":"2026-10-27T16:56:05.465699Z","level":"INFO","fields":{"message":"market tick","market":"binance_futures","depth":50,"trades":300,"ticker":0,"mark_price":5,"liquidations":1},"target":"quant_2::writer"}"#;
+        handle_line(kraken, Kind::Collector, "quant2", &state, &alerter);
+        handle_line(binance, Kind::Collector, "quant2", &state, &alerter);
 
         let st = state.lock().unwrap();
         let get = |m: &str, f: &'static str| st.counters.get(&(m.to_string(), f)).map(|c| c.0);
-        assert_eq!(get("futures", "depth"), Some(80));
-        assert_eq!(get("futures", "ticker"), Some(25));
-        assert_eq!(get("futures", "trades"), None, "trades can be legitimately quiet");
-        assert_eq!(get("spot", "depth"), None, "spot not seen yet");
+        assert_eq!(get("kraken_futures", "depth"), Some(80));
+        assert_eq!(get("kraken_futures", "ticker"), Some(25));
+        assert_eq!(get("kraken_futures", "trades"), None, "trades can be legitimately quiet");
+        assert_eq!(get("kraken_futures", "mark_price"), None, "not a Kraken stream");
+        assert_eq!(get("binance_futures", "depth"), Some(50));
+        assert_eq!(get("binance_futures", "mark_price"), Some(5));
+        assert_eq!(get("binance_futures", "trades"), None, "trades can be legitimately quiet");
+        assert_eq!(get("binance_futures", "liquidations"), None, "liquidations can be quiet for hours");
+        assert_eq!(get("kraken_spot", "depth"), None, "spot not seen yet");
     }
 }

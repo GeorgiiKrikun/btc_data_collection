@@ -1,7 +1,9 @@
 //! Collector configuration from environment variables.
 //!
-//!   ASSETS   (optional)  comma-separated base assets, default "btc,eth,sol,xrp,bnb"
-//!   MARKETS  (optional)  comma-separated subset of "spot,futures", default both
+//!   ASSETS           (optional)  comma-separated base assets, default "btc,eth,sol,xrp,bnb"
+//!   MARKETS          (optional)  Kraken markets, subset of "spot,futures", default both
+//!   BINANCE_MARKETS  (optional)  Binance BTCUSDT markets, subset of "spot,futures",
+//!                                default both; set to "none" to disable Binance
 
 use crate::models::Market;
 use std::sync::Arc;
@@ -20,27 +22,35 @@ pub struct Instrument {
 }
 
 pub struct Config {
+    /// Kraken instruments (Binance is BTCUSDT only and needs none)
     pub spot: Vec<Instrument>,
     pub futures: Vec<Instrument>,
+    /// every enabled market, Kraken and Binance
     pub markets: Vec<Market>,
 }
 
 impl Config {
     pub fn from_env() -> Config {
         let assets = env_list("ASSETS", DEFAULT_ASSETS);
-        let markets: Vec<Market> = env_list("MARKETS", DEFAULT_MARKETS)
-            .iter()
-            .filter_map(|m| match m.as_str() {
-                "spot" => Some(Market::Spot),
-                "futures" => Some(Market::Futures),
-                _ => None,
-            })
-            .collect();
+        let mut markets = parse_markets("MARKETS", Market::KrakenSpot, Market::KrakenFutures);
+        markets.extend(parse_markets("BINANCE_MARKETS", Market::BinanceSpot, Market::BinanceFutures));
 
         let spot = assets.iter().map(|a| spot_instrument(a)).collect();
         let futures = assets.iter().map(|a| futures_instrument(a)).collect();
         Config { spot, futures, markets }
     }
+}
+
+/// Reads a "spot,futures" subset; anything else (e.g. "none") enables nothing.
+fn parse_markets(key: &str, spot: Market, futures: Market) -> Vec<Market> {
+    env_list(key, DEFAULT_MARKETS)
+        .iter()
+        .filter_map(|m| match m.as_str() {
+            "spot" => Some(spot),
+            "futures" => Some(futures),
+            _ => None,
+        })
+        .collect()
 }
 
 fn env_list(key: &str, default: &str) -> Vec<String> {

@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_THRESHOLD: usize = 500;
 
-/// One output file family: `data/kraken/<market>/<instrument>/<stream>_YYYYMMDD.csv`.
+/// One output file family: `data/<venue>/<market>/<instrument>/<stream>_YYYYMMDD.csv`.
 type BufKey = (Market, Arc<str>, &'static str);
 
 #[derive(Default)]
@@ -18,6 +18,8 @@ struct Counters {
     depth: u64,
     trades: u64,
     ticker: u64,
+    mark_price: u64,
+    liquidations: u64,
 }
 
 pub async fn writer_task(mut rx: mpsc::Receiver<Record>, markets: Vec<Market>) {
@@ -40,7 +42,15 @@ pub async fn writer_task(mut rx: mpsc::Receiver<Record>, markets: Vec<Market>) {
                 info!(buffered, total_depth, total_trades, "flush tick");
                 for m in &markets {
                     let c = &counters[m];
-                    info!(market = m.as_str(), depth = c.depth, trades = c.trades, ticker = c.ticker, "market tick");
+                    info!(
+                        market = m.as_str(),
+                        depth = c.depth,
+                        trades = c.trades,
+                        ticker = c.ticker,
+                        mark_price = c.mark_price,
+                        liquidations = c.liquidations,
+                        "market tick"
+                    );
                 }
                 flush_all(&mut bufs).await;
             }
@@ -48,9 +58,11 @@ pub async fn writer_task(mut rx: mpsc::Receiver<Record>, markets: Vec<Market>) {
                 Some(rec) => {
                     let c = counters.entry(rec.market).or_default();
                     match rec.row {
-                        Row::Depth(_) => c.depth += 1,
-                        Row::SpotTrade(_) | Row::FutTrade(_) => c.trades += 1,
+                        Row::Depth(_) | Row::BinanceSpotDepth(_) | Row::BinanceFutDepth(_) => c.depth += 1,
+                        Row::SpotTrade(_) | Row::FutTrade(_) | Row::BinanceTrade(_) => c.trades += 1,
                         Row::Ticker(_) => c.ticker += 1,
+                        Row::MarkPrice(_) => c.mark_price += 1,
+                        Row::Liquidation(_) => c.liquidations += 1,
                     }
                     let key = (rec.market, rec.instrument, rec.row.stream());
                     let buf = bufs.entry(key.clone()).or_default();
@@ -80,7 +92,7 @@ async fn flush_all(bufs: &mut HashMap<BufKey, Vec<Row>>) {
 async fn flush((market, instrument, stream): &BufKey, records: Vec<Row>) {
     let n = records.len();
     let date = Utc::now().format("%Y%m%d").to_string();
-    let dir = format!("data/kraken/{}/{instrument}", market.as_str());
+    let dir = format!("data/{}/{instrument}", market.dir());
     let path = format!("{dir}/{stream}_{date}.csv");
     let result = match tokio::fs::create_dir_all(&dir).await {
         Ok(()) => write_csv_records(&path, records).await,
