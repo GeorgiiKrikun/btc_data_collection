@@ -11,6 +11,7 @@
 //!                (Kraken/Binance spot or futures) down while the others still flow
 //!   * uploader:  any WARN/ERROR line (S3 down, bad creds, ...)
 //!   * uploader:  absence of "sync pass complete" for too long -> uploader stuck/dead
+//!   * host:      free space below DISK_MIN_FREE_GB on any of DISK_PATHS
 //!
 //! Optionally it pings a HEALTHCHECK_URL (healthchecks.io / Better Stack) every
 //! 60s so you also get alerted if the whole host or this sidecar dies.
@@ -19,13 +20,17 @@
 //! COLLECTOR_SERVICE (default "quant2"), UPLOADER_SERVICE (default "uploader"),
 //! FLUSH_MAX_SILENCE_SECS (30), COUNTER_MAX_STALE_SECS (60),
 //! UPLOADER_MAX_SILENCE_SECS (900), ALERT_COOLDOWN_SECS (300),
-//! STARTUP_GRACE_SECS (60), CHECK_INTERVAL_SECS (10).
+//! STARTUP_GRACE_SECS (60), CHECK_INTERVAL_SECS (10), DISK_PATHS (comma-separated
+//! paths inside this container, e.g. "/,/app/data"; empty disables), DISK_MIN_FREE_GB (3).
 
 use anyhow::{Context, Result};
 use bollard::container::{ListContainersOptions, LogsOptions};
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
@@ -50,6 +55,8 @@ struct Config {
     startup_grace: Duration,
     check_interval: Duration,
     healthy_ping: Duration,
+    disk_paths: Vec<PathBuf>,
+    disk_min_free_gb: f64,
 }
 
 fn env_secs(key: &str, default: u64) -> Duration {
@@ -80,6 +87,17 @@ impl Config {
             check_interval: env_secs("CHECK_INTERVAL_SECS", 10),
             // Periodic "still healthy" confirmation. Default 6h; 0 disables.
             healthy_ping: env_secs("HEALTHY_PING_SECS", 21600),
+            disk_paths: std::env::var("DISK_PATHS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect(),
+            disk_min_free_gb: std::env::var("DISK_MIN_FREE_GB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3.0),
         })
     }
 }
@@ -412,6 +430,47 @@ async fn watch_service(
 }
 
 // ---------------------------------------------------------------------------
+// Disk space
+// ---------------------------------------------------------------------------
+
+/// Space available to unprivileged users on the filesystem holding `path`, in GB.
+/// Inside a container, "/" is the overlay on the host's Docker disk and a bind
+/// mount reports the filesystem it lives on.
+fn free_gb(path: &Path) -> std::io::Result<f64> {
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated string and `st` a valid out-pointer.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st.f_bavail as f64 * st.f_frsize as f64 / 1e9)
+}
+
+fn check_disks(cfg: &Config, alerter: &Alerter) {
+    for path in &cfg.disk_paths {
+        let shown = path.display();
+        match free_gb(path) {
+            Ok(free) => {
+                debug!("disk check: {shown} {free:.1} GB free");
+                alerter.sticky(
+                    &format!("disk:{shown}"),
+                    free < cfg.disk_min_free_gb,
+                    format!(
+                        "🔴 [disk] only {free:.1} GB free on {shown} (threshold {} GB)",
+                        cfg.disk_min_free_gb
+                    ),
+                    format!("🟢 [disk] {shown} back to {free:.1} GB free"),
+                );
+            }
+            Err(e) => alerter.transient(
+                &format!("disk:{shown}:error"),
+                format!("🟠 [disk] cannot stat {shown}: {e}"),
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Staleness detection
 // ---------------------------------------------------------------------------
 
@@ -495,6 +554,8 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
             ),
             "🟢 [uploader] sync resumed".into(),
         );
+
+        check_disks(&cfg, &alerter);
     }
 }
 
@@ -505,9 +566,9 @@ async fn staleness_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc
 /// Sends a positive status summary every `period` so silence can be trusted as
 /// "all good" rather than "logwatch is broken". Skips the ping while any alert is
 /// active — you're already being told about that — so a green ping is unambiguous.
-async fn healthy_ping_task(period: Duration, state: Arc<Mutex<State>>, alerter: Arc<Alerter>) {
+async fn healthy_ping_task(cfg: Arc<Config>, state: Arc<Mutex<State>>, alerter: Arc<Alerter>) {
     let start = Instant::now();
-    let mut ticker = interval(period);
+    let mut ticker = interval(cfg.healthy_ping);
     ticker.tick().await; // consume the immediate first tick — no ping at t=0
     loop {
         ticker.tick().await;
@@ -545,9 +606,14 @@ async fn healthy_ping_task(period: Duration, state: Arc<Mutex<State>>, alerter: 
             Some(a) => format!("uploader ok (last sync {a}s ago)"),
             None => "uploader: no sync yet".into(),
         };
+        let disks: String = cfg
+            .disk_paths
+            .iter()
+            .filter_map(|p| free_gb(p).ok().map(|gb| format!("; {} {gb:.1} GB free", p.display())))
+            .collect();
         let uptime_h = now.duration_since(start).as_secs() / 3600;
         alerter.send(format!(
-            "🟢 all healthy — {collector}; {uploader}; logwatch up {uptime_h}h"
+            "🟢 all healthy — {collector}; {uploader}{disks}; logwatch up {uptime_h}h"
         ));
     }
 }
@@ -609,7 +675,7 @@ async fn main() -> Result<()> {
 
     let cfg = Arc::new(Config::from_env()?);
     debug!(
-        "config: collector='{}' uploader='{}' flush_max={}s counter_max={}s uploader_max={}s cooldown={}s grace={}s check_every={}s healthy_ping={}s healthcheck={} chat_id={}",
+        "config: collector='{}' uploader='{}' flush_max={}s counter_max={}s uploader_max={}s cooldown={}s grace={}s check_every={}s healthy_ping={}s healthcheck={} chat_id={} disks={:?} disk_min_free={}GB",
         cfg.collector_service,
         cfg.uploader_service,
         cfg.flush_max_silence.as_secs(),
@@ -621,6 +687,8 @@ async fn main() -> Result<()> {
         cfg.healthy_ping.as_secs(),
         cfg.healthcheck_url.is_some(),
         cfg.chat_id,
+        cfg.disk_paths,
+        cfg.disk_min_free_gb,
     );
     let docker = Docker::connect_with_unix_defaults()
         .context("connect to /var/run/docker.sock")?;
@@ -671,7 +739,7 @@ async fn main() -> Result<()> {
     }
     if cfg.healthy_ping > Duration::ZERO {
         tokio::spawn(healthy_ping_task(
-            cfg.healthy_ping,
+            cfg.clone(),
             state.clone(),
             alerter.clone(),
         ));
@@ -712,5 +780,11 @@ mod tests {
         assert_eq!(get("binance_futures", "trades"), None, "trades can be legitimately quiet");
         assert_eq!(get("binance_futures", "liquidations"), None, "liquidations can be quiet for hours");
         assert_eq!(get("kraken_spot", "depth"), None, "spot not seen yet");
+    }
+
+    #[test]
+    fn free_gb_reads_a_real_filesystem() {
+        assert!(free_gb(Path::new("/")).unwrap() >= 0.0);
+        assert!(free_gb(Path::new("/does/not/exist")).is_err());
     }
 }

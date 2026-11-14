@@ -23,6 +23,8 @@ aws-sdk-s3 = "1"
 # ring-backed HTTPS client for Telegram / healthchecks (no aws-lc / cmake).
 bollard = { version = "0.17", default-features = false }
 ureq = { version = "2", features = ["json"] }
+# logwatch: statvfs for the free-space check
+libc = "0.2"
 
 [[bin]]
 name = "quant_2"

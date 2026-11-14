@@ -23,14 +23,19 @@ S3_BUCKET=... S3_ENDPOINT_URL=... cargo run --release --bin uploader
 # Control log level (default: info)
 RUST_LOG=quant_2=debug cargo run --release --bin quant_2
 
-# Run in Docker (collector + uploader + logwatch, production mode, auto-restarts)
+# Local Docker stack (collector + uploader + logwatch + dozzle on 127.0.0.1:8080), built from this repo
 cp .env.example .env   # then fill in S3 creds/bucket
 docker compose up -d --build
 docker compose logs -f
 docker compose down
+
+# One image per binary (distroless, ~35-55 MB each)
+docker build --target collector .   # also: uploader, logwatch
 ```
 
-Container users: quant2 and uploader run as the image's build-arg user, default UID 1000 / GID 100. `./data` must be writable by it (`chown -R 1000:100 data`), and `secrets/s3_credentials` readable by it. Don't use a `UID=$(id -u) …` prefix: `UID` is a read-only variable in bash. To build for another user, pass `docker compose build --build-arg UID=… --build-arg GID=…`. logwatch runs as root (`user: "0:0"` in compose) because it needs the Docker socket.
+**Deployment is not in this repo.** On every push to `main`, `.github/workflows/images.yml` runs the tests and pushes `ghcr.io/georgiikrikun/btc-{collector,uploader,logwatch}:sha-<7>` and `:main`. Production runs from the separate **infra** repo (`btc/compose.yml` there, server checkout `/srv/infra`, data `/srv/data/btc`), which pins those tags. Bumping only the uploader or logwatch image there doesn't recreate the collector.
+
+Container users: images are UID-agnostic. compose sets `user: "${APP_UID:-1000}:${APP_GID:-1000}"` for quant2 and uploader (set `APP_UID`/`APP_GID` in `.env` to match the owner of `./data`). `secrets/s3_credentials` must be readable by that user. logwatch runs as root (`user: "0:0"`) because it needs the Docker socket. The Dockerfile builds dependencies against placeholder sources first, so source-only changes rebuild quickly.
 
 ## Architecture
 
@@ -70,7 +75,9 @@ Binance futures /market     →  binance::run(Feed::FuturesMarket) ┘
 
   Configured entirely via env vars (`S3_BUCKET` required; `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX`, `S3_FORCE_PATH_STYLE`, `DATA_DIR`, `UPLOAD_INTERVAL_SECS`, `RETENTION_DAYS`); credentials use the standard AWS chain. See `.env.example`. The uploader mounts `./data` read-write (it deletes) and is independent of the collector's lifecycle.
 
-- `bin/logwatch.rs` — observability sidecar reading container logs via the Docker socket; Telegram alerts on WARN/ERROR lines, a missing `"flush tick"`, a frozen `total_depth`, a frozen per-market counter (`kraken_spot.depth`, `kraken_futures.depth`, `kraken_futures.ticker`, `binance_spot.depth`, `binance_futures.depth`, `binance_futures.mark_price` — trades and liquidations are never watched), or a missing uploader `"sync pass complete"`.
+- `bin/logwatch.rs` — observability sidecar reading container logs via the Docker socket; Telegram alerts on WARN/ERROR lines, a missing `"flush tick"`, a frozen `total_depth`, a frozen per-market counter (`kraken_spot.depth`, `kraken_futures.depth`, `kraken_futures.ticker`, `binance_spot.depth`, `binance_futures.depth`, `binance_futures.mark_price` — trades and liquidations are never watched), a missing uploader `"sync pass complete"`, or free space below `DISK_MIN_FREE_GB` (default 3) on any of `DISK_PATHS` (paths inside its container; compose mounts the data dir read-only and lists `/` for the host's root disk).
+
+Planned, not implemented: zstd-compressing finished day files in the uploader (about 10x smaller), see `docs/compression-plan.md`.
 
 ## Output schema
 

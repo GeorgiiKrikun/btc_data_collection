@@ -1,0 +1,69 @@
+# Tests, then builds the three images and pushes them to GHCR:
+#   ghcr.io/georgiikrikun/btc-{collector,uploader,logwatch}:sha-<7 chars>  and  :main
+# The infra repo (btc/compose.yml) pins the sha tag that runs on the server.
+name: images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked
+
+  images:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "sha=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # All three share the build stage, so after the first one the others are
+      # cache hits and only add their small runtime stage.
+      - name: collector
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: collector
+          push: true
+          tags: |
+            ghcr.io/georgiikrikun/btc-collector:${{ steps.tag.outputs.sha }}
+            ghcr.io/georgiikrikun/btc-collector:main
+          cache-from: type=gha,scope=btc
+          cache-to: type=gha,scope=btc,mode=max
+      - name: uploader
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: uploader
+          push: true
+          tags: |
+            ghcr.io/georgiikrikun/btc-uploader:${{ steps.tag.outputs.sha }}
+            ghcr.io/georgiikrikun/btc-uploader:main
+          cache-from: type=gha,scope=btc
+      - name: logwatch
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: logwatch
+          push: true
+          tags: |
+            ghcr.io/georgiikrikun/btc-logwatch:${{ steps.tag.outputs.sha }}
+            ghcr.io/georgiikrikun/btc-logwatch:main
+          cache-from: type=gha,scope=btc

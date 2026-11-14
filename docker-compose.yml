@@ -1,28 +1,41 @@
+# Local stack for development and testing: builds the images from this repo.
+# Production runs from the infra repo (btc/compose.yml), which pulls the same
+# images from ghcr.io and adds the reverse proxy.
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# Logs in a browser: http://localhost:8080 (dozzle, localhost-only).
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   quant2:
     build:
       context: .
-      args:
-        UID: ${UID:-1000}
-        GID: ${GID:-100}
-    image: btc_data_collection:latest
+      target: collector
+    image: btc-collector:local
+    # Owner of the files in ./data. Set APP_UID / APP_GID in .env to match your
+    # user (`id -u`, `id -g`) if you are not 1000:1000.
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
     restart: unless-stopped
     # ASSETS / MARKETS / BINANCE_MARKETS (optional; defaults in src/config.rs) come from .env.
     env_file:
       - .env
     volumes:
       - ./data:/app/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *logging
 
   uploader:
-    image: btc_data_collection:latest
-    command: ["./target/release/uploader"]
-    depends_on:
-      - quant2
+    build:
+      context: .
+      target: uploader
+    image: btc-uploader:local
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
     restart: unless-stopped
     env_file:
       - .env
@@ -36,31 +49,21 @@ services:
     volumes:
       # read-write: the uploader also prunes old local files (RETENTION_DAYS)
       - ./data:/app/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *logging
 
-  # --- Observability ---
-
-  # Log watcher. Reads quant2 + uploader logs via the Docker socket (read-only,
-  # like dozzle) and sends a Telegram alert on WARN/ERROR lines, a stalled
-  # collector (no "Flush tick" / frozen depth counter), or a stalled uploader
-  # (no "sync pass complete"). Optionally pings HEALTHCHECK_URL every 60s so you
-  # also get alerted if the whole host or this sidecar dies. See .env.example.
+  # Log watcher. Reads quant2 + uploader logs via the Docker socket (read-only)
+  # and sends a Telegram alert on WARN/ERROR lines, a stalled collector or a
+  # stalled uploader. See .env.example.
   logwatch:
-    image: btc_data_collection:latest
-    command: ["./target/release/logwatch"]
-    # The Docker socket is root:docker 0660, so the image's default user
-    # (UID 1000) can't open it. Socket access is root-equivalent anyway, so
-    # running this read-only log reader as root grants nothing extra (dozzle
-    # runs as root too). It writes no files.
+    build:
+      context: .
+      target: logwatch
+    image: btc-logwatch:local
+    # The Docker socket is root:docker 0660. Socket access is root-equivalent
+    # anyway, so running this read-only log reader as root grants nothing
+    # extra. It writes no files.
     user: "0:0"
     restart: unless-stopped
-    depends_on:
-      - quant2
-      - uploader
     env_file:
       - .env
     environment:
@@ -69,64 +72,26 @@ services:
       RUST_LOG: ${LOGWATCH_LOG:-logwatch=info}
       COLLECTOR_SERVICE: quant2
       UPLOADER_SERVICE: uploader
+      # Free-space alert: the data dir is mounted read-only below.
+      DISK_PATHS: /app/data
       # NOTE: all other tunables (incl. UPLOADER_MAX_SILENCE_SECS — keep it well
       # above UPLOAD_INTERVAL_SECS) come from .env via env_file above. Do not
       # hardcode them here: values in `environment:` override `.env`.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+      - ./data:/app/data:ro
+    logging: *logging
 
-  # Web log viewer. Reads logs for every container on the host via the Docker
-  # socket (read-only), so quant2 + uploader show up automatically. It has NO
-  # published port: it is only reachable through the npm reverse proxy below.
   dozzle:
-    image: amir20/dozzle:latest
+    image: amir20/dozzle:v11.4.3
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       DOZZLE_NO_ANALYTICS: "true"
-    networks:
-      - proxy
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-  # Reverse proxy: terminates TLS and enforces password protection (NPM
-  # "Access Lists"). Configure proxy hosts / certs / auth in the admin UI, then
-  # point a proxy host at `dozzle:8080`.
-  #
-  # The admin UI (port 81) is bound to 127.0.0.1 only, so it is NOT reachable
-  # from the internet. Reach it on demand via an SSH tunnel:
-  #     ssh -L 8181:localhost:81 <user>@<server>
-  # then browse http://localhost:8181 on your laptop. Only 80/443 are public.
-  npm:
-    image: jc21/nginx-proxy-manager:latest
-    restart: unless-stopped
-    ports:
-      - "80:80"              # HTTP (redirect to HTTPS)
-      - "443:443"            # HTTPS runtime — the only public entry point
-      - "127.0.0.1:81:81"    # admin UI, localhost-only (SSH-tunnel to reach)
-    volumes:
-      - ./npm/data:/data
-      - ./npm/letsencrypt:/etc/letsencrypt
-    networks:
-      - proxy
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-networks:
-  proxy:
-    driver: bridge
+    logging: *logging
 
 secrets:
   s3_credentials:
